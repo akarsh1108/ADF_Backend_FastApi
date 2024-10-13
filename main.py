@@ -1,17 +1,21 @@
 
+from contextlib import redirect_stderr, redirect_stdout
+import io
 import time
 from fastapi import BackgroundTasks, FastAPI, Depends, Form, UploadFile, File, HTTPException,Request
 from typing import List
 from fastapi.middleware.cors import CORSMiddleware
+import nbformat
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from .services.activity.copy.main import getFileSource1, uploadFiles , copyData  ,getDataWithFormatChange
 from .database import get_db_1, get_db_2, get_db_3
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 import logging
 import httpx
 from enum import Enum
 from pydantic import constr
+import traceback
 app = FastAPI()
 
 app.add_middleware(
@@ -62,10 +66,10 @@ class CopyData(BaseModel):
     
 @app.post("/copy-data/")
 def copy_data(
-    source: int = Form(...),  # Get source from form data
-    filename: str = Form(...),  # Get filename from form data
-    filetype: str = Form(...),  # Get filetype from form data
-    file: UploadFile = File(...),  # Receive file upload
+    source: int = Form(...),  
+    filename: str = Form(...), 
+    filetype: str = Form(...),  
+    file: UploadFile = File(...),  
     db1: Session = Depends(get_db_2), 
     db2: Session = Depends(get_db_3)
 ):
@@ -141,21 +145,24 @@ def start_copy_data_task(background_tasks: BackgroundTasks, db1: Session = Depen
 
 
 
+class ExecuteApiRequest(BaseModel):
+    title: str
+    url: str
+    method: str = "GET"
+    headers: dict = {}
+    data: dict = None
 @app.post("/executeApi")
-async def execute_api(request: Request):
+async def execute_api(body: ExecuteApiRequest):
     try:
+        # Extract data from the request body
+        url = body.url
+        method = body.method.upper()  # Ensure method is uppercase
+        headers = body.headers
+        data = body.data
 
-        body = await request.json()
-
-        # Extract data from the request body (curl-like data)
-        url = body.get('url')
-        method = body.get('method', 'GET').upper()  # Default to GET
-        headers = body.get('headers', {})
-        data = body.get('data', None)  # This can be used for POST, PUT, etc.
-
-        # Ensure URL is provided
-        if not url:
-            raise HTTPException(status_code=400, detail="URL is required")
+        # Validate the HTTP method
+        if method not in ["GET", "POST", "PUT", "DELETE"]:
+            raise HTTPException(status_code=405, detail="HTTP method not supported")
 
         # Create an HTTP client to execute the request
         async with httpx.AsyncClient() as client:
@@ -167,11 +174,14 @@ async def execute_api(request: Request):
                 response = await client.put(url, headers=headers, json=data)
             elif method == 'DELETE':
                 response = await client.delete(url, headers=headers)
-            else:
-                raise HTTPException(status_code=405, detail="HTTP method not supported")
-
-        # Return the JSON response from the external API
-        return response.json()
+                # Prepare the result
+        print(response.json())
+        result = {
+                    "filename": body.title.split('.')[0] + f".json",
+                    "content":  response.json(),
+                    "filetype": 'application/json'
+        }
+        return {"message": "Data retrieved successfully", "data": result}
 
     except httpx.RequestError as e:
         raise HTTPException(status_code=500, detail=f"Request failed: {str(e)}")
@@ -179,14 +189,103 @@ async def execute_api(request: Request):
         raise HTTPException(status_code=400, detail=str(e))
     
 
-class ExecuteApiRequest(BaseModel):
-    title: str
-    url: HttpUrl
-    method: str = "GET"
-    headers: dict = {}
-    data: dict = None
 
-@app.post("/executeApi")
-async def execute_api(body: ExecuteApiRequest):
-    response= await execute_api(body)
-    return response
+def run_code_cell(code, cell_position):
+    try:
+        # Create a string buffer to capture output
+        output_buffer = io.StringIO()
+        error_buffer = io.StringIO()
+        
+        # Redirect stdout and stderr to the buffers
+        with redirect_stdout(output_buffer), redirect_stderr(error_buffer):
+            exec(code)
+        
+        # Retrieve the output and error messages
+        output = output_buffer.getvalue()
+        errors = error_buffer.getvalue()
+        
+        if errors:
+            raise Exception(errors)
+        
+        return {
+            "success": True,
+            "cell_position": cell_position,
+            "output": output
+        }
+    
+    except SyntaxError as e:
+        # Handle syntax errors explicitly
+        return {
+            "success": False,
+            "cell_position": cell_position,
+            "error": {
+                "type": "SyntaxError",
+                "message": str(e),
+                "traceback": f"Line {e.lineno}: {e.text.strip()}",
+            }
+        }
+    
+    except Exception as e:
+        # Handle all other exceptions and capture traceback as string
+        error_traceback = traceback.format_exc()  # Format the full traceback as a string
+        return {
+            "success": False,
+            "cell_position": cell_position,
+            "error": {
+                "type": type(e).__name__,
+                "message": str(e),
+                "traceback": error_traceback,  # Store traceback as a string
+            }
+        }
+
+@app.post("/compileNotebook/")
+async def compile_notebook(file: UploadFile = File(...)):
+    try:
+        # Ensure the uploaded file is a .ipynb file
+        if not file.filename.endswith(".ipynb"):
+            raise HTTPException(status_code=400, detail="File must be a Jupyter Notebook (.ipynb)")
+
+        # Read the notebook
+        content = await file.read()
+        notebook = nbformat.reads(content.decode("utf-8"), as_version=nbformat.NO_CONVERT)
+
+        if notebook["nbformat"] < 4:
+            raise HTTPException(status_code=400, detail="Unsupported notebook format. Use a format >= 4.")
+        
+        # Extract and run code cells
+        errors = []
+        last_successful_cell = None
+        
+        for index, cell in enumerate(notebook.cells):
+            if cell.cell_type == "code":
+                code = cell.source 
+                result = run_code_cell(code, index + 1)  
+
+                if not result["success"]:
+                    # Return structured error details along with the last successful cell
+                    return {
+                        "message": "Error encountered during execution",
+                        "last_successful_cell": last_successful_cell,
+                        "error_details": result["error"]
+                    }
+                else:
+                    last_successful_cell = result
+
+        # If no errors, return the last successful cell
+        return {
+            "message": "Notebook ran successfully, no errors encountered.",
+            "last_successful_cell": last_successful_cell
+        }
+
+    except Exception as e:
+        error_traceback = traceback.format_exc()
+        # Return structured error response
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Error processing notebook",
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "traceback": error_traceback
+            }
+        )

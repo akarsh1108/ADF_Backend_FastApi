@@ -2,7 +2,7 @@ from io import StringIO
 import os
 from tempfile import NamedTemporaryFile
 from turtle import pd
-from fastapi import Depends, HTTPException,UploadFile,File
+from fastapi import Depends, Form, HTTPException,UploadFile,File
 import httpx
 from sqlalchemy import text
 import sys
@@ -166,6 +166,25 @@ def json_to_csv(json_content):
     writer.writeheader()
     writer.writerows(json_data)
     return output.getvalue()
+
+def copy_data(
+    source: int = Form(...),  
+    filename: str = Form(...),  
+    filetype: str = Form(...), 
+    file: UploadFile = File(...), 
+    db1: Session = Depends(get_db_2), 
+    db2: Session = Depends(get_db_3)
+):
+    # Choose the database based on the source
+    db = db1 if source == 1 else db2
+
+    # Read the file content
+    file_content = file.file.read()
+
+    # Process the file data and store it in the database
+    result = copyData(filename, file_content, filetype, db)
+
+    return result
 
 def copyData(filename: str, content: bytes, filetype: str, db: Session):
     try:
@@ -364,33 +383,3 @@ def getDataWithFormatChange(body, db1: Session = Depends(get_db_2)):
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
     
-async def excuteApi(body):
-    try:
-        # Extract data from the request body
-        url = body.url
-        method = body.method.upper()  # Ensure method is uppercase
-        headers = body.headers
-        data = body.data
-
-        # Validate the HTTP method
-        if method not in ["GET", "POST", "PUT", "DELETE"]:
-            raise HTTPException(status_code=405, detail="HTTP method not supported")
-
-        # Create an HTTP client to execute the request
-        async with httpx.AsyncClient() as client:
-            if method == 'GET':
-                response = await client.get(url, headers=headers)
-            elif method == 'POST':
-                response = await client.post(url, headers=headers, json=data)
-            elif method == 'PUT':
-                response = await client.put(url, headers=headers, json=data)
-            elif method == 'DELETE':
-                response = await client.delete(url, headers=headers)
-
-        # Return the JSON response from the external API
-        return response.json()
-
-    except httpx.RequestError as e:
-        raise HTTPException(status_code=500, detail=f"Request failed: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
