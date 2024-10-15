@@ -15,6 +15,7 @@ import json
 import pusher
 from fastapi import BackgroundTasks
 import time
+from datetime import datetime
 
 pusher = pusher.Pusher(
   app_id='1879605',
@@ -50,8 +51,19 @@ def getFileSource1(db: Session = Depends(get_db_1)):
         })
         raise HTTPException(status_code=500, detail=str(e))
     
+import base64
 
-ALLOWED_FILE_TYPES = ["text/csv", "application/json", "text/plain", "application/xml", "text/xml"]
+import os
+
+ALLOWED_FILE_TYPES = [
+    "text/csv", 
+    "application/json", 
+    "text/plain", 
+    "application/xml", 
+    "text/xml", 
+    "application/x-ipynb+json",
+    "application/octet-stream"  # Allow octet-stream if extension is .ipynb
+]
 
 def uploadFiles(file: UploadFile = File(...), db: Session = Depends(get_db_1)):
     try:
@@ -60,37 +72,36 @@ def uploadFiles(file: UploadFile = File(...), db: Session = Depends(get_db_1)):
             "message": "Uploading file...",
             "status": "success"
         })
+
         file_type = file.content_type
-        if file_type not in ALLOWED_FILE_TYPES:
+        file_extension = os.path.splitext(file.filename)[1].lower()
+
+        # If file type is 'application/octet-stream', ensure it is a .ipynb file
+        if file_type == "application/octet-stream" and file_extension != ".ipynb":
             pusher.trigger("logs-channel", "log-event", {
-                "label":"Upload File Activity",
-                "message": f"Invalid file type '{file_type}'. Only CSV, JSON, TXT, and XML files are allowed.",
+                "label": "Upload File Activity",
+                "message": f"Invalid file type '{file_type}' for file '{file.filename}'. Only .ipynb files are allowed for this type.",
                 "status": "error"
             })
             raise HTTPException(
                 status_code=400, 
-                detail=f"Invalid file type '{file_type}'. Only CSV, JSON, TXT, and XML files are allowed."
+                detail=f"Invalid file type '{file_type}' for file '{file.filename}'. Only .ipynb files are allowed for this type."
             )
 
-        file_content = file.file.read()
-        
-        countDuplicate = db.execute(
-            text("SELECT COUNT(*) FROM FileStorage WHERE filename = :filename"), 
-            {"filename": file.filename}
-        ).fetchone()[0]
-        
-        if countDuplicate > 0:
+        # Check the file type or extension
+        if file_type not in ALLOWED_FILE_TYPES and file_extension != ".ipynb":
             pusher.trigger("logs-channel", "log-event", {
-                "label":"Upload File Activity",
-                "message": "File already exists",
+                "label": "Upload File Activity",
+                "message": f"Invalid file type '{file_type}'. Only CSV, JSON, TXT, XML, and IPYNB files are allowed.",
                 "status": "error"
             })
-            raise HTTPException(status_code=400, detail="File already exists")
-        
-        if checkFileCurrupt(file):
-            raise HTTPException(status_code=400, detail="File is corrupted or unreadable")
-        
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Invalid file type '{file_type}'. Only CSV, JSON, TXT, XML, and IPYNB files are allowed."
+            )
 
+        # Read the file content
+        file_content = file.file.read()
         db.execute(text("""
         IF OBJECT_ID('FileStorage', 'U') IS NULL
         BEGIN
@@ -98,12 +109,43 @@ def uploadFiles(file: UploadFile = File(...), db: Session = Depends(get_db_1)):
                 id INT IDENTITY PRIMARY KEY,
                 filename VARCHAR(255),
                 content VARBINARY(MAX),
-                filetype VARCHAR(255)
+                filetype VARCHAR(255),
+                upload_time DATETIME
             );
         END
-        INSERT INTO FileStorage (filename, content, filetype) VALUES (:filename, :content, :filetype)
-        """), {"filename": file.filename, "content": file_content, "filetype": file_type})
+        """))
+
+        # Check for duplicate file in the database
+        countDuplicate = db.execute(
+            text("SELECT COUNT(*) FROM FileStorage WHERE filename = :filename"), 
+            {"filename": file.filename}
+        ).fetchone()[0]
+
+        if countDuplicate > 0:
+            pusher.trigger("logs-channel", "log-event", {
+                "label": "Upload File Activity",
+                "message": "File already exists",
+                "status": "error"
+            })
+            raise HTTPException(status_code=400, detail="File already exists")
+
+        # Ensure that the FileStorage table exists before inserting
         
+        db.commit()
+
+        current_time = datetime.utcnow()
+
+        # Insert the file into the database as binary content
+        db.execute(text("""
+        INSERT INTO FileStorage (filename, content, filetype, upload_time) 
+        VALUES (:filename, :content, :filetype, :upload_time)
+        """), {
+            "filename": file.filename, 
+            "content": file_content,  # Direct binary data
+            "filetype": file_type, 
+            "upload_time": current_time
+        })
+
         db.commit()
         pusher.trigger("logs-channel", "log-event", {
             "label":"Upload File Activity",
@@ -111,7 +153,7 @@ def uploadFiles(file: UploadFile = File(...), db: Session = Depends(get_db_1)):
             "status": "success"
         })
         return {"message": "File uploaded successfully"}
-    
+
     except Exception as e:
         pusher.trigger("logs-channel", "log-event", {
             "label":"Upload File Activity",
@@ -119,8 +161,6 @@ def uploadFiles(file: UploadFile = File(...), db: Session = Depends(get_db_1)):
         })
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
-    
-
 def checkFileCurrupt(file: UploadFile = File(...)) -> bool:
     try:
         pusher.trigger("logs-channel", "log-event", {
@@ -498,3 +538,96 @@ def getDataWithFormatChange(body, db1: Session = Depends(get_db_2)):
         raise HTTPException(status_code=400, detail=str(e))
     
 
+async def eventBased(dbs:Session,dbd:Session):
+    try:
+       pusher.trigger("logs-channel", "log-event", {
+            "message": "Copying data..."
+        })
+
+       file= dbs.execute(text("select Top 1 * from FileStorage order by upload_time desc")).fetchall()
+       if not file:
+           raise HTTPException(status_code=404,detail="No data found for the given id")
+       for row in file:
+           checkExist = dbd.execute(text("SELECT COUNT(*) FROM FileStorage WHERE filename = :filename"), {"filename": row.filename}).fetchone()[0]
+           if checkExist > 0:
+               raise HTTPException(status_code=400, detail="File already exists")
+           print(row)
+           dbd.execute(text("""
+            INSERT INTO FileStorage (filename, content, filetype, upload_time)
+            VALUES (:filename, :content, :filetype, :upload_time)
+            """), {
+            "filename": row.filename,
+            "content": row.content,
+            "filetype": row.filetype,
+            "upload_time": datetime.utcnow()
+            })
+       dbd.commit()
+       pusher.trigger("logs-channel", "log-event", {
+            "message": "Data copied successfully"
+        })
+       return {"message": f"Data copied successfully "}
+    except Exception as e:
+        pusher.trigger("logs-channel", "log-event", {
+            "message": f"Error: {str(e)}"
+        })
+        dbd.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+    
+
+async def extract_unique(db1: Session = Depends(get_db_2), db2: Session = Depends(get_db_3)):
+    file = db1.execute(text("SELECT filename FROM FileStorage")).fetchall()
+    files_to_copy = db2.execute(text("SELECT filename FROM FileStorage")).fetchall()
+    
+    file_set = {row.filename for row in file}
+    files_to_copy_set = {row.filename for row in files_to_copy}
+    
+    unique_files = file_set - files_to_copy_set
+    
+    return  list(unique_files)
+
+async def tumblingWindow(intervals: int, dbs: Session, dbd: Session):
+    try:
+        pusher.trigger("logs-channel", "log-event", {
+            "message": "Copying data..."
+        })
+        uniqueList = await extract_unique(dbs, dbd)
+        if len(uniqueList) == 0:
+            return {"message": f"{intervals - len(uniqueList)} files to be uploaded before tumbling"}
+        placeholders = ', '.join([':filename' + str(i) for i in range(len(uniqueList))])
+        query = f"SELECT * FROM FileStorage WHERE filename IN ({placeholders})"
+        params = {f'filename{i}': filename for i, filename in enumerate(uniqueList)}
+        
+        file = dbs.execute(text(query), params).fetchall()
+        # print(file)
+        if len(file) < intervals:
+            return {"message": f"{intervals - len(file)} files to be uploaded before tumbling"}
+        
+        if not file:
+            raise HTTPException(status_code=404, detail="No data found for the given id")
+        
+        for row in file:
+            checkExist = dbd.execute(text("SELECT COUNT(*) FROM FileStorage WHERE filename = :filename"), {"filename": row.filename}).fetchone()
+            if checkExist[0] > 0:
+                raise HTTPException(status_code=400, detail="File already exists")
+            
+            dbd.execute(text("""
+                INSERT INTO FileStorage (filename, content, filetype, upload_time)
+                VALUES (:filename, :content, :filetype, :upload_time)
+            """), {
+                "filename": row.filename,
+                "content": row.content,
+                "filetype": row.filetype,
+                "upload_time": datetime.utcnow()
+            })
+        
+        dbd.commit()
+        pusher.trigger("logs-channel", "log-event", {
+            "message": "Files copied successfully"
+        })
+        return {"message": f"Files copied successfully"}
+    except Exception as e:
+        pusher.trigger("logs-channel", "log-event", {
+            "message": f"Error: {str(e)}"
+        })
+        dbd.rollback()
+        raise HTTPException(status_code=400, detail=str(e))

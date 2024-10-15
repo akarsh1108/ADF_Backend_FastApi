@@ -8,7 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import nbformat
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from .services.activity.copy.main import getFileSource1, uploadFiles , copyData  ,getDataWithFormatChange
+from .services.activity.copy.main import eventBased, getFileSource1, uploadFiles , copyData  ,getDataWithFormatChange ,tumblingWindow
 from .database import get_db_1, get_db_2, get_db_3
 from pydantic import BaseModel
 import logging
@@ -404,6 +404,34 @@ async def logs(req: Log, db: Session = Depends(get_db_2)):
         return {"message": "Log added successfully"}
     except Exception as e:
         db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+class Schedule(BaseModel):
+    source:int
+    destination:int
+    label: str
+    interval: int = None
+    schedular: int = None
+
+@app.post("/scheduling")
+async def schedule_task(req:Schedule,db1: Session = Depends(get_db_2), db2: Session = Depends(get_db_3)):
+    try:
+        if req.source==1:
+            dbs=db1
+        else:
+            dbs=db2
+        if req.destination==1:
+            dbd=db1
+        else:
+            dbd=db2
+        if req.label == 'Event Based':
+            response = await eventBased(dbs,dbd)
+        elif req.label == 'Tumbling Window':
+            response = await tumblingWindow(req.interval,dbs,dbd)
+        elif req.label == 'Scheduler':
+            response = 'To be implemented'
+        return response
+    except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
