@@ -12,8 +12,17 @@ from sqlalchemy.orm import Session
 import base64
 import csv
 import json
+import pusher
 from fastapi import BackgroundTasks
 import time
+
+pusher = pusher.Pusher(
+  app_id='1879605',
+  key='aeeb90d987e5e72bddbe',
+  secret='543074e9650b9560798e',
+  cluster='ap2',
+  ssl=True
+)
 
 def get_db_by_id(id: int):
     if id == 1:
@@ -22,14 +31,23 @@ def get_db_by_id(id: int):
         return get_db_2
 def getFileSource1(db: Session = Depends(get_db_1)):
     try:
+        pusher.trigger("logs-channel", "log-event", {
+        "message": f"Running node: Fetching data from source location",
+        })
         files = db.execute(text("SELECT * FROM FileStorage")).fetchall()
         file_list = []
         for row in files:
             file_dict = dict(row._mapping)
             file_dict['content'] = base64.b64encode(file_dict['content']).decode('utf-8')
             file_list.append(file_dict)
+        pusher.trigger("logs-channel", "log-event", {
+        "message": f"Running node: Fetched data from source location",
+        })
         return file_list
     except Exception as e:
+        pusher.trigger("logs-channel", "log-event", {
+        "message": f"Error: {str(e)}",
+        })
         raise HTTPException(status_code=500, detail=str(e))
     
 
@@ -37,8 +55,18 @@ ALLOWED_FILE_TYPES = ["text/csv", "application/json", "text/plain", "application
 
 def uploadFiles(file: UploadFile = File(...), db: Session = Depends(get_db_1)):
     try:
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Upload File Activity",
+            "message": "Uploading file...",
+            "status": "success"
+        })
         file_type = file.content_type
         if file_type not in ALLOWED_FILE_TYPES:
+            pusher.trigger("logs-channel", "log-event", {
+                "label":"Upload File Activity",
+                "message": f"Invalid file type '{file_type}'. Only CSV, JSON, TXT, and XML files are allowed.",
+                "status": "error"
+            })
             raise HTTPException(
                 status_code=400, 
                 detail=f"Invalid file type '{file_type}'. Only CSV, JSON, TXT, and XML files are allowed."
@@ -52,6 +80,11 @@ def uploadFiles(file: UploadFile = File(...), db: Session = Depends(get_db_1)):
         ).fetchone()[0]
         
         if countDuplicate > 0:
+            pusher.trigger("logs-channel", "log-event", {
+                "label":"Upload File Activity",
+                "message": "File already exists",
+                "status": "error"
+            })
             raise HTTPException(status_code=400, detail="File already exists")
         
         if checkFileCurrupt(file):
@@ -72,50 +105,49 @@ def uploadFiles(file: UploadFile = File(...), db: Session = Depends(get_db_1)):
         """), {"filename": file.filename, "content": file_content, "filetype": file_type})
         
         db.commit()
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Upload File Activity",
+            "message": "File uploaded successfully",
+            "status": "success"
+        })
         return {"message": "File uploaded successfully"}
     
     except Exception as e:
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Upload File Activity",
+            "message": f"Error: {str(e)}"
+        })
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
     
 
 def checkFileCurrupt(file: UploadFile = File(...)) -> bool:
     try:
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Currupt File Activity",
+            "message": "Checking file integrity...",
+            "status": "success"
+        })
         # Ensure the file pointer is at the beginning
         file.file.seek(0)  
         file_content = file.file.read()
         # Reset the file pointer to the beginning after reading
         file.file.seek(0)
         # If no exception, the file is not corrupted  
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Currupt File Activity",
+            "message": "File is not corrupted and readable",
+            "status": "success"
+        })
         return False  
     except Exception:
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Currupt File Activity",
+            "message": "File is corrupted or unreadable",
+            "status": "error"
+        })
         return True 
-    
-# def copyData(body, db1: Session = Depends(get_db_2), db2: Session = Depends(get_db_3)):
-#     try:
-#         db1.execute(text("SELECT * INTO ##temp FROM FileStorage WHERE id = :id").bindparams(id=body.id))
-#         temp_data = db1.execute(text("SELECT * FROM ##temp")).fetchall()
 
-#         for row in temp_data:
-#             checkExist = db2.execute(text("SELECT COUNT(*) FROM FileStorage WHERE filename = :filename"), {"filename": row.filename}).fetchone()[0]
-#             if checkExist > 0:
-#                 raise HTTPException(status_code=400, detail="File already exists")    
-#             db2.execute(text("""
-#                 INSERT INTO FileStorage ( filename, content, filetype)
-#                 VALUES ( :filename, :content, :filetype)
-#             """), {
-#                 "filename": row.filename,
-#                 "content": row.content,
-#                 "filetype": row.filetype
-#             })
-        
-#         db1.execute(text("DROP TABLE ##temp"))
-        
-#         db2.commit()
-#         return {"message": f"Data copied successfully for id {body.id}"}
-#     except Exception as e:
-#         db2.rollback()
-#         raise HTTPException(status_code=400, detail=str(e))
 
 
 import xml.etree.ElementTree as ET
@@ -124,6 +156,10 @@ import xml.etree.ElementTree as ET
 
 
 def copyDataSchedule( interval: int, background_tasks: BackgroundTasks, db1: Session = Depends(get_db_2), db2: Session = Depends(get_db_3)):
+    pusher.trigger("logs-channel", "log-event", {
+        "message": "Scheduled copy data task started",
+        "status": "success"
+    })
     def copy_data_task():
         while True:
             try:
@@ -144,27 +180,48 @@ def copyDataSchedule( interval: int, background_tasks: BackgroundTasks, db1: Ses
                     db2.commit()
                 time.sleep(interval)
             except Exception as e:
+                pusher.trigger("logs-channel", "log-event", {
+                    "message": f"Error: {str(e)}",
+                    "status": "error"
+                })
                 db2.rollback()
                 raise HTTPException(status_code=400, detail=str(e))
 
     background_tasks.add_task(copy_data_task)
+   
     return {"message": "Scheduled copy data task started"}
 
 
 def csv_to_json(csv_content):
     """Convert CSV content to JSON format."""
+    pusher.trigger("logs-channel", "log-event", {
+        "message": "Converting CSV to JSON",
+        "status": "success"
+    })
     csv_file = StringIO(csv_content)
     reader = csv.DictReader(csv_file)
     json_data = json.dumps([row for row in reader])
+    pusher.trigger("logs-channel", "log-event", {
+        "message": "CSV converted to JSON",
+        "status": "success"
+    })
     return json_data
 
 def json_to_csv(json_content):
     """Convert JSON content to CSV format."""
+    pusher.trigger("logs-channel", "log-event", {
+        "message": "Converting JSON to CSV",
+        "status": "success"
+    })
     json_data = json.loads(json_content)
     output = StringIO()
     writer = csv.DictWriter(output, fieldnames=json_data[0].keys())
     writer.writeheader()
     writer.writerows(json_data)
+    pusher.trigger("logs-channel", "log-event", {
+        "message": "Converted JSON to CSV",
+        "status": "success"
+    })
     return output.getvalue()
 
 def copy_data(
@@ -175,6 +232,9 @@ def copy_data(
     db1: Session = Depends(get_db_2), 
     db2: Session = Depends(get_db_3)
 ):
+    pusher.trigger("logs-channel", "log-event", {
+        "message": "Copying data..."
+    })
     # Choose the database based on the source
     db = db1 if source == 1 else db2
 
@@ -183,20 +243,37 @@ def copy_data(
 
     # Process the file data and store it in the database
     result = copyData(filename, file_content, filetype, db)
+    pusher.trigger("logs-channel", "log-event", {
+        "message": "Data copied successfully"
+    })
 
     return result
 
 def copyData(filename: str, content: bytes, filetype: str, db: Session):
     try:
         # Check if the file already exists in the database
+        pusher.trigger("logs-channel", "log-event", {
+            "label": "Copy Data Activity",
+            "message": "Checking if file already exists...",
+            "status": "success"
+        })
         checkExist = db.execute(
             text("SELECT COUNT(*) FROM FileStorage WHERE filename = :filename"),
             {"filename": filename}
         ).fetchone()[0]
 
         if checkExist > 0:
+            pusher.trigger("logs-channel", "log-event", {
+                "label": "Copy Data Activity",
+                "message": "File already exists",
+                "status": "error"
+            })
             raise HTTPException(status_code=400, detail="File already exists")
-
+        pusher.trigger("logs-channel", "log-event", {
+            "label": "Copy Data Activity",
+            "message": f"Inserting {filename} data to new location...",
+            "status": "success"
+        })
         # Insert the file data into the database
         db.execute(text("""
             INSERT INTO FileStorage (filename, content, filetype)
@@ -206,12 +283,22 @@ def copyData(filename: str, content: bytes, filetype: str, db: Session):
             "content": content,
             "filetype": filetype
         })
+        pusher.trigger("logs-channel", "log-event", {
+            "label": "Copy Data Activity",
+            "message": f"Data copied successfully ",
+            "status": "success"
+        })
 
         db.commit()
 
         return {"message": f"Data copied successfully for filename {filename}"}
 
     except Exception as e:
+        pusher.trigger("logs-channel", "log-event", {
+            "label": "Copy Data Activity",
+            "message": f"Error: {str(e)}",
+            "status": "error"
+        })
         db.rollback()
         raise HTTPException(status_code=400, detail=str(e))
     
@@ -309,14 +396,28 @@ def xml_to_txt(xml_content):
 
 def getDataWithFormatChange(body, db1: Session = Depends(get_db_2)):
     try:
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Format Activity",
+            "message": f"Running node: Fetching data from source database for id {body.id}",
+            "status": "success"
+        })
         # Fetch data from the source database
         temp_data = db1.execute(text("SELECT * FROM FileStorage WHERE id = :id").bindparams(id=body.id)).fetchall()
 
         if not temp_data:
+            pusher.trigger("logs-channel", "log-event", {
+                "label":"Format Activity",
+                "message": f"No data found for id {body.id}",
+                "status": "error"
+            })
             raise HTTPException(status_code=404, detail="No data found for the given id")
 
         result = []
-
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Format Activity",
+            "message": f"Data fetched successfully for id {body.id}",
+            "status": "success"
+        })
         # Iterate over the fetched rows and perform format conversion if needed
         for row in temp_data:
             content = row.content
@@ -355,6 +456,10 @@ def getDataWithFormatChange(body, db1: Session = Depends(get_db_2)):
                 elif target_format == 'csv':
                     content = xml_to_csv(row.content)
             else:
+                pusher.trigger("logs-channel", "log-event", {
+                    "label":"Format Activity",
+                    "message": f"Unsupported format conversion",
+                    "status": "error"})
                 raise HTTPException(status_code=400, detail="Unsupported format conversion")
             
 
@@ -368,7 +473,11 @@ def getDataWithFormatChange(body, db1: Session = Depends(get_db_2)):
               
             # Clean up the temporary file
             os.remove(temp_file_path)
-
+            pusher.trigger("logs-channel", "log-event", {
+                "label":"Format Activity",
+                "message": f"Converted data to {body.format} format",
+                "status": "success"
+            })
 
             # Prepare the result
             result.append({
@@ -381,5 +490,11 @@ def getDataWithFormatChange(body, db1: Session = Depends(get_db_2)):
         return {"message": f"Data retrieved successfully for id {body.id}", "data": result}
 
     except Exception as e:
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Format Activity",
+            "message": f"Error: {str(e)}",
+            "status": "error"
+        })
         raise HTTPException(status_code=400, detail=str(e))
     
+

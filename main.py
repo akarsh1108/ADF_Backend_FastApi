@@ -16,6 +16,8 @@ import httpx
 from enum import Enum
 from pydantic import constr
 import traceback
+import pusher
+from datetime import datetime
 app = FastAPI()
 
 app.add_middleware(
@@ -24,6 +26,14 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+pusher = pusher.Pusher(
+  app_id='1879605',
+  key='aeeb90d987e5e72bddbe',
+  secret='543074e9650b9560798e',
+  cluster='ap2',
+  ssl=True
 )
 
 
@@ -36,6 +46,11 @@ def get_db_by_id(id: int):
 
 @app.get("/getfileSource1/{id}")
 def getupload_fileSource1(id: int, db1: Session = Depends(get_db_2),db2: Session = Depends(get_db_3)):
+    pusher.trigger("logs-channel", "log-event", {
+        "message": f"Running node: Connection Node",
+        "status": "success"
+    })
+
     if(id==1):
         file_list = getFileSource1( db1)
     else:
@@ -96,6 +111,7 @@ async def file_convert(body: FormatFile, db1: Session = Depends(get_db_2), db2: 
         res = getDataWithFormatChange(body,db1)
         return res
     except Exception as e:
+        
         raise HTTPException(status_code=400, detail=str(e))
 
     
@@ -159,7 +175,11 @@ async def execute_api(body: ExecuteApiRequest):
         method = body.method.upper()  # Ensure method is uppercase
         headers = body.headers
         data = body.data
-
+        pusher.trigger("logs-channel", "log-event", {
+            "label" : "API Activity",
+            "message": f"Executing API request: {method} {url}",
+            "status": "success"
+        })
         # Validate the HTTP method
         if method not in ["GET", "POST", "PUT", "DELETE"]:
             raise HTTPException(status_code=405, detail="HTTP method not supported")
@@ -176,6 +196,11 @@ async def execute_api(body: ExecuteApiRequest):
                 response = await client.delete(url, headers=headers)
                 # Prepare the result
         print(response.json())
+        pusher.trigger("logs-channel", "log-event", {
+            "label" : "API Activity",
+            "message": f"Request successful: {response.status_code}",
+            "status": "success"
+        })
         result = {
                     "filename": body.title.split('.')[0] + f".json",
                     "content":  response.json(),
@@ -184,8 +209,18 @@ async def execute_api(body: ExecuteApiRequest):
         return {"message": "Data retrieved successfully", "data": result}
 
     except httpx.RequestError as e:
+        pusher.trigger("logs-channel", "log-event", {
+            "label" : "API Activity",
+            "message": f"Request failed: {str(e)}",
+            "status": "error"
+        })
         raise HTTPException(status_code=500, detail=f"Request failed: {str(e)}")
     except Exception as e:
+        pusher.trigger("logs-channel", "log-event", {
+            "label" : "API Activity",
+            "message": f"Error encountered during execution: {str(e)}",
+            "status": "error"
+        })
         raise HTTPException(status_code=400, detail=str(e))
     
 
@@ -227,6 +262,16 @@ def run_code_cell(code, cell_position):
     
     except Exception as e:
         # Handle all other exceptions and capture traceback as string
+        pusher.trigger("logs-channel", "log-event", {
+            "label": "Jupyter Notebook Activity",
+            "message": f"Error encountered during execution",
+            "detail": {
+                "type": type(e).__name__,
+                "message": str(e),
+                "traceback": traceback.format_exc()
+            },
+            "status": "error"
+        })
         error_traceback = traceback.format_exc()  # Format the full traceback as a string
         return {
             "success": False,
@@ -240,9 +285,19 @@ def run_code_cell(code, cell_position):
 
 @app.post("/compileNotebook/")
 async def compile_notebook(file: UploadFile = File(...)):
+
     try:
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Jupyter Notebook Activity",
+            "message": f"Running node: Compile Notebook",
+            "status": "success"
+            })
         # Ensure the uploaded file is a .ipynb file
         if not file.filename.endswith(".ipynb"):
+            pusher.trigger("logs-channel", "log-event", {
+                "label":"Jupyter Notebook Activity",
+                "message": f"File must be a Jupyter Notebook (.ipynb)",
+                "status": "error"})
             raise HTTPException(status_code=400, detail="File must be a Jupyter Notebook (.ipynb)")
 
         # Read the notebook
@@ -250,8 +305,17 @@ async def compile_notebook(file: UploadFile = File(...)):
         notebook = nbformat.reads(content.decode("utf-8"), as_version=nbformat.NO_CONVERT)
 
         if notebook["nbformat"] < 4:
+            pusher.trigger("logs-channel", "log-event", {
+                "label":"Jupyter Notebook Activity",
+                "message": f"Unsupported notebook format. Use a format >= 4.",
+                "status": "error"})   
             raise HTTPException(status_code=400, detail="Unsupported notebook format. Use a format >= 4.")
         
+
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Jupyter Notebook Activity",
+            "message": f"Notebook loaded successfully",
+            "status": "success"})
         # Extract and run code cells
         errors = []
         last_successful_cell = None
@@ -264,12 +328,18 @@ async def compile_notebook(file: UploadFile = File(...)):
                 if not result["success"]:
                     # Return structured error details along with the last successful cell
                     return {
+                        "label":"Jupyter Notebook Activity",
                         "message": "Error encountered during execution",
                         "last_successful_cell": last_successful_cell,
                         "error_details": result["error"]
                     }
                 else:
                     last_successful_cell = result
+        
+        pusher.trigger("logs-channel", "log-event", {
+            "label":"Jupyter Notebook Activity",
+            "message": f"Notebook ran successfully, no errors encountered.",
+            "status":"success"})
 
         # If no errors, return the last successful cell
         return {
@@ -278,6 +348,15 @@ async def compile_notebook(file: UploadFile = File(...)):
         }
 
     except Exception as e:
+        pusher.trigger("logs-channel", "log-event", {
+            "message": f"Error processing notebook",
+            "detail": {
+                "message": "Error processing notebook",
+                "error_type": type(e).__name__,
+                "error_message": str(e),
+                "traceback": error_traceback
+            }
+        })
         error_traceback = traceback.format_exc()
         # Return structured error response
         raise HTTPException(
@@ -289,3 +368,42 @@ async def compile_notebook(file: UploadFile = File(...)):
                 "traceback": error_traceback
             }
         )
+
+class Log(BaseModel):
+    message: str
+    status: str
+    label: str 
+    timestamp: datetime = datetime.now()
+
+@app.post("/catching-logs/")
+async def logs(req: Log, db: Session = Depends(get_db_2)):
+    try:
+        # Ensure the logs table exists in SQL Server
+        db.execute(text("""
+            IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'logs')
+            CREATE TABLE logs (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                message TEXT NOT NULL,
+                status TEXT NOT NULL,
+                label TEXT NOT NULL,
+                timestamp DATETIME NOT NULL
+            )
+        """))
+
+        # Insert the log entry
+        db.execute(text("""
+            INSERT INTO logs (message, status, label, timestamp)
+            VALUES (:message, :status, :label, :timestamp)
+        """), {
+            "message": req.message,
+            "status": req.status,
+            "label": req.label,
+            "timestamp": req.timestamp
+        })
+        db.commit()
+        return {"message": "Log added successfully"}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+
